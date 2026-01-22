@@ -39,8 +39,16 @@ FP8_BLOCK_QUANT_KWARGS = {
 MXFP8_BLOCK_QUANT_KWARGS = {
     "activation_scheme": "dynamic",
     "fmt": "e4m3",
-    "quant_method": "mxfp8",
+    "quant_method": "ascend",
     "weight_block_size": [1, 32],
+    # Enable dynamic inference mode, no need to pre-generate quant_model_description.json
+    # for each model. Just specify default_quant_type, vllm-ascend will automatically
+    # infer quant type based on layer type:
+    # - lm_head, embedding, norm layers -> FLOAT
+    # - Other Linear, MoE layers -> default_quant_type (W8A8_MXFP8)
+    "default_quant_type": "W8A8_MXFP8",
+    # group_size for MXFP8 quantization
+    "group_size": 32,
 }
 
 # Ref: https://github.com/NVIDIA-NeMo/RL/commit/bc24887c72a6e1b2699a228bc87c588546dfe6b7
@@ -63,11 +71,55 @@ def is_mxfp8_vllm_ascend(quant_config):
             # Check if the specific quantization method is MXFP8
             # AscendQuantConfig stores config in quant_description
             quant_method = quant_config.quant_description.get("quant_method")
-            return quant_method in ["W8A8_MXFP8", "mxfp8"]
+            return quant_method in ["ascend"]
     except ImportError:
         pass
 
     return False
+
+
+def restore_mxfp8_weights_for_loading(model):
+    """Restore MXFP8 weights to original shapes before weight loading.
+
+    This function iterates through all linear modules in the model and restores
+    their weights from the transformed MXFP8 format back to the original format
+    that the weight loader expects.
+
+    Must be called BEFORE model.load_weights() in RL training loops.
+    """
+    try:
+        from vllm.model_executor.layers.linear import LinearBase
+    except ImportError:
+        logger.warning("Could not import LinearBase, skipping MXFP8 weight restore")
+        return
+
+    for name, module in model.named_modules():
+        if isinstance(module, LinearBase) and hasattr(module, '_mxfp8_transformed'):
+            if hasattr(module, 'quant_method') and hasattr(module.quant_method, 'restore_weights_for_rl_loading'):
+                logger.debug(f"Restoring MXFP8 weights for module: {name}")
+                module.quant_method.restore_weights_for_rl_loading(module)
+
+
+def apply_mxfp8_transformation_after_loading(model):
+    """Re-apply MXFP8 transformations after weight loading.
+
+    This function iterates through all linear modules in the model and applies
+    the MXFP8 transformations (transpose, reshape) that are required for NPU
+    inference.
+
+    Must be called AFTER model.load_weights() in RL training loops.
+    """
+    try:
+        from vllm.model_executor.layers.linear import LinearBase
+    except ImportError:
+        logger.warning("Could not import LinearBase, skipping MXFP8 transformation")
+        return
+
+    for name, module in model.named_modules():
+        if isinstance(module, LinearBase) and hasattr(module, '_mxfp8_original_shapes'):
+            if hasattr(module, 'quant_method') and hasattr(module.quant_method, 'process_weights_after_loading'):
+                logger.debug(f"Applying MXFP8 transformation for module: {name}")
+                module.quant_method.process_weights_after_loading(module)
 
 
 def is_fp8_model(vllm_config):
@@ -311,6 +363,17 @@ def load_quanted_weights(weights, model_runner):
     quant_config = model_runner.vllm_config.quant_config
     vllm_dtype = model_runner.vllm_config.model_config.dtype
 
+    # Check if this is MXFP8 on NPU - need special handling for weight reload
+    is_mxfp8_npu = is_mxfp8_vllm_ascend(quant_config)
+
+    if is_mxfp8_npu:
+        # For MXFP8 on NPU, we need to restore weights to original shapes
+        # before loading, then re-apply transformation after loading.
+        # This is because process_weights_after_loading transposes the weights,
+        # but the weight_loader expects original shapes.
+        logger.info("MXFP8 NPU detected: restoring weights for RL reload")
+        restore_mxfp8_weights_for_loading(model)
+
     weights_quantized = quant_weights(weights, model, quant_config, dtype=vllm_dtype)
 
     # Monkey patch the param class to their subclass, as certain models
@@ -325,6 +388,12 @@ def load_quanted_weights(weights, model_runner):
     for name, param in model.named_parameters():
         if hasattr(param, "subclass_type"):
             param.__class__ = param.orig_type
+
+    if is_mxfp8_npu:
+        # Re-apply MXFP8 transformations after weight loading
+        logger.info("MXFP8 NPU: re-applying transformations after weight load")
+        apply_mxfp8_transformation_after_loading(model)
+
     return loaded_params
 
 

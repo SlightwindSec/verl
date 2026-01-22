@@ -277,30 +277,40 @@ class vLLMHttpServer:
             set_expandable_segments(True)
 
         quantization = self.config.quantization
+        quant_config_kwargs = None  # Quantization config parameters
 
         if quantization is not None:
-            _SUPPORTED_QUANTIZATION = ["fp8", "mxfp8", "torchao"]
+            # Supported quantization methods:
+            # - fp8: CUDA FP8 quantization
+            # - mxfp8: MXFP8 quantization (converted to ascend)
+            # - ascend: Ascend NPU MXFP8 quantization
+            # - torchao: TorchAO quantization
+            _SUPPORTED_QUANTIZATION = ["fp8", "mxfp8", "ascend", "torchao"]
             if quantization not in _SUPPORTED_QUANTIZATION:
                 raise ValueError(f"Currently only support {_SUPPORTED_QUANTIZATION} quantization, got: {quantization}")
 
             if quantization == "fp8":
                 from verl.utils.vllm.vllm_fp8_utils import FP8_BLOCK_QUANT_KWARGS
-                fp8_block_quant_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
+                quant_config_kwargs = dict(FP8_BLOCK_QUANT_KWARGS)
                 # Apply vllm fp8 patches
                 # Will remove the patch after vllm support on-the-fly quant for rollout natively.
                 apply_vllm_fp8_patches()
-            elif quantization == "mxfp8":
+            elif quantization in ["mxfp8", "ascend"]:
+                # Both mxfp8 and ascend use MXFP8_BLOCK_QUANT_KWARGS
+                # vllm-ascend will automatically handle layer quant types in dynamic mode
                 from verl.utils.vllm.vllm_fp8_utils import MXFP8_BLOCK_QUANT_KWARGS
-                fp8_block_quant_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
-                # TODO(slightwindsec): apply MXFP8 patches?
-                pass
+                quant_config_kwargs = dict(MXFP8_BLOCK_QUANT_KWARGS)
+                # Use "ascend" as the vllm quantization parameter
+                quantization = "ascend"
 
         hf_overrides = {}
         if quantization is not None and self.config.quantization_config_file is not None:
             hf_overrides["quantization_config_file"] = self.config.quantization_config_file
 
-        if quantization == "fp8" or quantization == "mxfp8":
-            hf_overrides["quantization_config"] = fp8_block_quant_kwargs
+        # Pass quantization config to vllm
+        # For fp8 and ascend quantization, need to pass quantization_config
+        if quant_config_kwargs is not None:
+            hf_overrides["quantization_config"] = quant_config_kwargs
 
         args = {
             "dtype": self.config.dtype,
